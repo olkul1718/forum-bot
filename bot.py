@@ -29,7 +29,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
-TELEGRAM_TOKEN  = os.environ["TELEGRAM_TOKEN"]
+print("ENV KEYS:", [k for k in os.environ.keys()])
+TELEGRAM_TOKEN  = os.environ.get("TELEGRAM_TOKEN") or os.environ.get("TELEGRAM_TOKEN\n") or ""
+if not TELEGRAM_TOKEN:
+    raise ValueError("TELEGRAM_TOKEN not found in: " + str(list(os.environ.keys())))
 OPENAI_API_KEY  = os.environ["OPENAI_API_KEY"]
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "")
 OPENAI_MODEL    = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
