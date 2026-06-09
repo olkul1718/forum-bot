@@ -1,6 +1,5 @@
 """
 Бот для отработки контактов на форуме Движение-2026.
-Поддерживает текст и голосовые. Создаёт лиды в AmoCRM.
 """
 import json
 import logging
@@ -10,6 +9,7 @@ import tempfile
 
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
+import httpx
 from telegram import (
     InlineKeyboardButton, InlineKeyboardMarkup,
     KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove, Update,
@@ -22,34 +22,52 @@ from telegram.ext import (
 from amocrm import AmoCRM, ContactData
 
 load_dotenv()
+
+# ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    level=logging.INFO,
+    level=logging.DEBUG,
 )
+# Убираем spam от httpx/telegram на уровне INFO
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.INFO)
+logging.getLogger("apscheduler").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
-print("ENV KEYS:", [k for k in os.environ.keys()])
-TELEGRAM_TOKEN  = os.environ.get("TELEGRAM_TOKEN") or os.environ.get("TELEGRAM_TOKEN\n") or ""
-if not TELEGRAM_TOKEN:
-    raise ValueError("TELEGRAM_TOKEN not found in: " + str(list(os.environ.keys())))
-OPENAI_API_KEY  = os.environ["OPENAI_API_KEY"]
-OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "")
-OPENAI_MODEL    = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+logger.info("=== BOT STARTING ===")
+logger.info("ENV KEYS: %s", list(os.environ.keys()))
 
-AMO_IDA_SUBDOMAIN   = os.environ["AMO_IDA_SUBDOMAIN"]
-AMO_IDA_TOKEN       = os.environ["AMO_IDA_TOKEN"]
-AMO_IDA_PIPELINE_ID = int(os.getenv("AMO_IDA_PIPELINE_ID", "0"))
+TELEGRAM_TOKEN  = os.getenv("TELEGRAM_TOKEN", "").strip()
+OPENAI_API_KEY  = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "").strip()
+OPENAI_MODEL    = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
 
-AMO_LITE_SUBDOMAIN   = os.environ["AMO_LITE_SUBDOMAIN"]
-AMO_LITE_TOKEN       = os.environ["AMO_LITE_TOKEN"]
-AMO_LITE_PIPELINE_ID = int(os.getenv("AMO_LITE_PIPELINE_ID", "0"))
+AMO_IDA_SUBDOMAIN   = os.getenv("AMO_IDA_SUBDOMAIN", "").strip()
+AMO_IDA_TOKEN       = os.getenv("AMO_IDA_TOKEN", "").strip()
+AMO_IDA_PIPELINE_ID = int(os.getenv("AMO_IDA_PIPELINE_ID", "0") or "0")
+
+AMO_LITE_SUBDOMAIN   = os.getenv("AMO_LITE_SUBDOMAIN", "").strip()
+AMO_LITE_TOKEN       = os.getenv("AMO_LITE_TOKEN", "").strip()
+AMO_LITE_PIPELINE_ID = int(os.getenv("AMO_LITE_PIPELINE_ID", "0") or "0")
+
+GOOGLE_SHEET_WEBHOOK = os.getenv("GOOGLE_SHEET_WEBHOOK", "").strip()
 
 ALLOWED_USERS_RAW = os.getenv("ALLOWED_USERS", "")
 ALLOWED_USERS: set[int] = (
     {int(u.strip()) for u in ALLOWED_USERS_RAW.split(",") if u.strip()}
     if ALLOWED_USERS_RAW.strip() else set()
 )
+
+logger.info("TELEGRAM_TOKEN loaded: %s", bool(TELEGRAM_TOKEN))
+logger.info("TELEGRAM_TOKEN first 10 chars: %s", repr(TELEGRAM_TOKEN[:15]))
+logger.info("OPENAI_API_KEY loaded: %s", bool(OPENAI_API_KEY))
+logger.info("AMO_IDA_SUBDOMAIN: %s", AMO_IDA_SUBDOMAIN)
+logger.info("AMO_LITE_SUBDOMAIN: %s", AMO_LITE_SUBDOMAIN)
+logger.info("GOOGLE_SHEET_WEBHOOK loaded: %s", bool(GOOGLE_SHEET_WEBHOOK))
+
+if not TELEGRAM_TOKEN:
+    raise ValueError("TELEGRAM_TOKEN is empty! Check .env or Railway Variables.")
 
 oai = AsyncOpenAI(
     api_key=OPENAI_API_KEY,
@@ -79,28 +97,23 @@ def is_allowed(uid: int) -> bool:
 
 
 def simple_extract(text: str, existing: dict) -> dict:
-    """Regex-парсер — fallback без GPT."""
     result = dict(existing)
     t = text.strip()
 
-    # Телефон
     m = re.search(r'[\+7|8][\d\s\-\(\)]{9,14}', t)
     if m and not result.get("phone"):
         result["phone"] = re.sub(r'[\s\-\(\)]', '', m.group())
 
-    # Email
     m = re.search(r'[\w\.\-]+@[\w\.\-]+\.\w+', t)
     if m and not result.get("email"):
         result["email"] = m.group()
 
-    # AmoCRM аккаунт
     tl = t.lower()
     if any(w in tl for w in ["идапроджект", "идапроект", "проджект", " ida", "крупн"]):
         result["crm_account"] = "ida"
     elif any(w in tl for w in ["лайт", "lite", "небольш", "маленьк"]):
         result["crm_account"] = "lite"
 
-    # Имя — первый фрагмент с заглавной буквы
     clean = re.sub(r'[\+7|8][\d\s\-\(\)]{9,14}', '', t)
     clean = re.sub(r'[\w\.\-]+@[\w\.\-]+\.\w+', '', clean)
     parts = [p.strip() for p in re.split(r'[,\n;]', clean) if p.strip()]
@@ -117,15 +130,15 @@ EXTRACT_SYSTEM = """
 Ты ассистент на B2B-форуме. Из текста извлеки контактные данные и верни JSON.
 
 Поля:
-- name: имя и фамилия (строка или null)
-- company: название компании контакта (строка или null)
+- name: имя и фамилия контакта (строка или null)
+- company: название компании контакта. Компания часто начинается с: ООО, АО, ИП, ЖК, СЗ, ГК, ТЦ, ТРЦ, МФЦ (строка или null)
 - phone: номер телефона (строка или null)
 - email: почта (строка или null)
-- comment: любой комментарий/заметка (строка или null)
-- crm_account: "ida" если "ИдаПроджект"/"проджект"/"крупный", "lite" если "Ида.Лайт"/"лайт"/"небольшой", null если непонятно
+- comment: комментарий (строка или null)
+- crm_account: "ida" если ИдаПроджект/крупный, "lite" если Ида.Лайт/небольшой, null если непонятно
 - interest: тема/интерес (строка или null)
 
-Верни ТОЛЬКО валидный JSON без пояснений.
+Верни ТОЛЬКО валидный JSON.
 """.strip()
 
 
@@ -142,7 +155,6 @@ async def extract(text: str, existing: dict) -> dict:
         ],
     )
     raw = resp.choices[0].message.content or "{}"
-    # Вырезаем JSON из ответа (модель может добавить markdown)
     m = re.search(r'\{.*\}', raw, re.DOTALL)
     parsed = json.loads(m.group()) if m else {}
     merged = dict(existing)
@@ -153,12 +165,20 @@ async def extract(text: str, existing: dict) -> dict:
 
 
 async def smart_extract(text: str, existing: dict) -> dict:
-    """GPT с fallback на regex."""
     try:
         return await extract(text, existing)
     except Exception as e:
         logger.warning("GPT недоступен (%s) — regex fallback", e)
         return simple_extract(text, existing)
+
+
+def normalize_phone(phone: str) -> str:
+    digits = re.sub(r'\D', '', phone)
+    if len(digits) == 10:
+        return f"+7{digits}"
+    if len(digits) == 11 and digits[0] in ("7", "8"):
+        return f"+7{digits[1:]}"
+    return phone
 
 
 def has_identity(d: dict) -> bool:
@@ -180,7 +200,6 @@ def card(d: dict) -> str:
 
 
 def editable_text(d: dict) -> str:
-    """Текст для редактирования — один блок, который пользователь может поправить."""
     crm_label = {"ida": "ИдаПроджект", "lite": "Ида.Лайт"}.get(d.get("crm_account", ""), "")
     parts = [
         d.get("name") or "",
@@ -195,19 +214,49 @@ def editable_text(d: dict) -> str:
 
 
 def data_to_contact(d: dict) -> ContactData:
+    raw_phone = d.get("phone") or ""
+    phone = normalize_phone(raw_phone) if raw_phone else ""
     return ContactData(
         name=d.get("name") or "",
         company=d.get("company") or "",
-        phone=d.get("phone") or "",
+        phone=phone,
         email=d.get("email") or "",
         comment=d.get("comment") or "",
         interest=d.get("interest") or "",
         crm_account=d.get("crm_account"),
     )
 
+
+async def push_to_sheets(contact: ContactData) -> None:
+    if not GOOGLE_SHEET_WEBHOOK:
+        logger.info("Google Sheets webhook not configured, skipping")
+        return
+    payload = {
+        "name": contact.name, "company": contact.company,
+        "phone": contact.phone, "email": contact.email,
+        "interest": contact.interest, "comment": contact.comment,
+        "crm_account": contact.crm_account or "",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=15, follow_redirects=False) as client:
+            resp = await client.post(GOOGLE_SHEET_WEBHOOK, json=payload)
+            if resp.status_code in (301, 302, 303, 307, 308):
+                redirect_url = resp.headers.get("location", "")
+                if redirect_url:
+                    resp = await client.post(redirect_url, json=payload)
+        logger.info("Google Sheets: %s %s", resp.status_code, resp.text[:100])
+    except Exception as e:
+        logger.warning("Google Sheets ошибка: %s", e)
+
+# ── Error handler ─────────────────────────────────────────────────────────────
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.error("Exception handling update %s:", update, exc_info=context.error)
+
 # ── Handlers ──────────────────────────────────────────────────────────────────
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    logger.info("cmd_start from user %s", update.effective_user.id)
     if not is_allowed(update.effective_user.id):
         await update.message.reply_text("⛔ Нет доступа.")
         return ConversationHandler.END
@@ -215,9 +264,8 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     ctx.user_data.clear()
     await update.message.reply_text(
         "👋 Привет! Бот для записи контактов с форума Движение-2026.\n\n"
-        "Напиши или надиктуй данные контакта — имя, компанию, телефон или почту. "
-        "Можно всё сразу в одном сообщении.\n\n"
-        "_Пример: Иван Петров, ООО Стройтех, +79161234567, веб-разработка, ИдаПроджект_",
+        "Напиши или надиктуй данные контакта — имя, компанию, телефон или почту.\n\n"
+        "_Пример: Иван Петров, ООО Стройтех, +79161234567, ИдаПроджект_",
         parse_mode="Markdown",
         reply_markup=ReplyKeyboardRemove(),
     )
@@ -225,18 +273,25 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def _process_text(text: str, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    logger.info("_process_text: %s", text[:50])
     existing = ctx.user_data.get("contact", {})
-    ctx.user_data["contact"] = await smart_extract(text, existing)
+    data = await smart_extract(text, existing)
+    if data.get("phone"):
+        data["phone"] = normalize_phone(data["phone"])
+    ctx.user_data["contact"] = data
+    logger.info("Extracted contact: %s", data)
     return await _check_and_proceed(update, ctx)
 
 
 async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    logger.info("handle_text from user %s: %s", update.effective_user.id, update.message.text[:50])
     if not is_allowed(update.effective_user.id):
         return ConversationHandler.END
     return await _process_text(update.message.text, update, ctx)
 
 
 async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    logger.info("handle_voice from user %s", update.effective_user.id)
     if not is_allowed(update.effective_user.id):
         return ConversationHandler.END
 
@@ -270,6 +325,7 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 
 async def _check_and_proceed(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     d = ctx.user_data.get("contact", {})
+    logger.info("_check_and_proceed: %s", d)
 
     if not has_identity(d):
         await update.message.reply_text(
@@ -285,18 +341,12 @@ async def _check_and_proceed(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
         )
         return ASK_CRM
 
-    if not d.get("interest"):
-        await update.message.reply_text(
-            "С чем лучше к ним зайти? (напиши текстом)",
-            reply_markup=ReplyKeyboardRemove(),
-        )
-        return ASK_INTEREST
-
     return await _show_confirm(update, ctx)
 
 
 async def handle_crm_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     t = update.message.text.strip().lower()
+    logger.info("handle_crm_choice: %s", t)
     if "лайт" in t or "lite" in t:
         ctx.user_data.setdefault("contact", {})["crm_account"] = "lite"
     elif "ида" in t or "проджект" in t or "ida" in t:
@@ -304,13 +354,6 @@ async def handle_crm_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> i
     else:
         await update.message.reply_text("Выбери, пожалуйста:", reply_markup=KB_CRM)
         return ASK_CRM
-
-    d = ctx.user_data.get("contact", {})
-    if not d.get("interest"):
-        await update.message.reply_text(
-            "С чем лучше к ним зайти?", reply_markup=KB_INTEREST
-        )
-        return ASK_INTEREST
 
     return await _show_confirm(update, ctx)
 
@@ -329,8 +372,7 @@ async def _show_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         )
     else:
         await update.message.reply_text(
-            text, parse_mode="Markdown",
-            reply_markup=KB_CONFIRM,
+            text, parse_mode="Markdown", reply_markup=KB_CONFIRM,
         )
     return CONFIRM
 
@@ -338,6 +380,7 @@ async def _show_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 async def handle_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
+    logger.info("handle_confirm: %s", query.data)
 
     if query.data == "confirm_edit":
         d = ctx.user_data.get("contact", {})
@@ -357,10 +400,7 @@ async def handle_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 async def handle_editing(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     if not is_allowed(update.effective_user.id):
         return ConversationHandler.END
-    # Полностью переписываем данные из нового текста
-    ctx.user_data["contact"] = await smart_extract(
-        update.message.text, {}
-    )
+    ctx.user_data["contact"] = await smart_extract(update.message.text, {})
     return await _check_and_proceed(update, ctx)
 
 
@@ -369,6 +409,7 @@ async def _send_to_amo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     contact = data_to_contact(d)
     crm = amocrm_ida if contact.crm_account == "ida" else amocrm_lite
     crm_label = "ИдаПроджект" if contact.crm_account == "ida" else "Ида.Лайт"
+    logger.info("_send_to_amo: %s -> %s", contact.name, crm_label)
 
     query = update.callback_query
     reply = query.message.reply_text if query else update.message.reply_text
@@ -376,10 +417,12 @@ async def _send_to_amo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     await reply("⏳ Отправляю в AMO…")
     try:
         lead_id = crm.create_lead(contact)
+        await push_to_sheets(contact)
         await reply(f"✅ Лид #{lead_id} создан в {crm_label}!\n\nСледующий контакт или /start.")
+        logger.info("Lead %s created successfully", lead_id)
     except Exception as e:
         logger.exception("AmoCRM error")
-        await reply(f"❌ Ошибка AMO: {e}\n\nПопробуй ещё раз или проверь настройки.")
+        await reply(f"❌ Ошибка AMO: {e}\n\nПопробуй ещё раз.")
 
     ctx.user_data.clear()
     return ConversationHandler.END
@@ -394,6 +437,7 @@ async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 
 def main() -> None:
     app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app.add_error_handler(error_handler)
 
     conv = ConversationHandler(
         entry_points=[
@@ -425,8 +469,9 @@ def main() -> None:
     )
 
     app.add_handler(conv)
-    logger.info("Bot started.")
-    app.run_polling()
+    logger.info("Bot started. Token: %s... Webhook: %s",
+                TELEGRAM_TOKEN[:15], bool(GOOGLE_SHEET_WEBHOOK))
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
