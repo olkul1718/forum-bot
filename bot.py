@@ -185,16 +185,21 @@ def has_identity(d: dict) -> bool:
     return bool(d.get("name") or d.get("phone") or d.get("email"))
 
 
+def _esc(v) -> str:
+    import html
+    return html.escape(str(v)) if v else "—"
+
+
 def card(d: dict) -> str:
     crm_label = {"ida": "ИдаПроджект", "lite": "Ида.Лайт"}.get(d.get("crm_account", ""), "—")
     return (
-        "📋 *Новый контакт:*\n\n"
-        f"👤 Имя: {d.get('name') or '—'}\n"
-        f"🏢 Компания: {d.get('company') or '—'}\n"
-        f"📞 Телефон: {d.get('phone') or '—'}\n"
-        f"📧 Email: {d.get('email') or '—'}\n"
-        f"💼 Интерес: {d.get('interest') or '—'}\n"
-        f"💬 Комментарий: {d.get('comment') or '—'}\n"
+        "📋 <b>Новый контакт:</b>\n\n"
+        f"👤 Имя: {_esc(d.get('name'))}\n"
+        f"🏢 Компания: {_esc(d.get('company'))}\n"
+        f"📞 Телефон: {_esc(d.get('phone'))}\n"
+        f"📧 Email: {_esc(d.get('email'))}\n"
+        f"💼 Интерес: {_esc(d.get('interest'))}\n"
+        f"💬 Комментарий: {_esc(d.get('comment'))}\n"
         f"🗂 AmoCRM: {crm_label}"
     )
 
@@ -368,11 +373,11 @@ async def _show_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     text = card(d) + "\n\nВсё верно?"
     if update.callback_query:
         await update.callback_query.edit_message_text(
-            text, parse_mode="Markdown", reply_markup=KB_CONFIRM
+            text, parse_mode="HTML", reply_markup=KB_CONFIRM
         )
     else:
         await update.message.reply_text(
-            text, parse_mode="Markdown", reply_markup=KB_CONFIRM,
+            text, parse_mode="HTML", reply_markup=KB_CONFIRM,
         )
     return CONFIRM
 
